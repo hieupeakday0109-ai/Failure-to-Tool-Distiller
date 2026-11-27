@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scar-forge"
+version = "0.1.0"
+description = "Self-evolving Python AI agent engine that distills runtime failures into telegraphic Scar axioms and hot-reloadable AST-verified Skills."
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Hieu Peak", email = "hieupeakne0109@gmail.com" }]
+dependencies = [
+    "pydantic>=2.6,<3.0",
+    "psutil>=5.9,<8.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    "httpx>=0.27,<1.0",
+    "google-genai>=1.0,<4.0",
+    "click>=8.1,<9.0",
+    "Flask>=3.0,<4.0",
+    "rich>=13.7,<16.0",
+    "pandas>=2.2,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<10.0",
+    "ruff>=0.8,<1.0",
+]
+
+[project.scripts]
+scar-forge = "scar_forge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
