@@ -289,6 +289,7 @@ def apply_unified_diff(
         old_lines: list[str] = []
         new_lines: list[str] = []
         new_no_newline = False
+        last_hunk_op = ""
 
         while idx < len(diff_lines) and (
             len(old_lines) < old_count or len(new_lines) < new_count
@@ -297,9 +298,9 @@ def apply_unified_diff(
             if line.startswith("@@ "):
                 break
             if line.startswith(r"\ No newline at end of file"):
-                # Applies to preceding '-' or '+' side; track if it followed '+'
-                if len(new_lines) == new_count and (
-                    len(old_lines) < old_count or new_count > 0
+                # Applies to preceding '-' or '+'/' ' side; only mark new if it followed '+' or ' '
+                if last_hunk_op in {"+", " "} and (
+                    len(new_lines) == new_count or len(old_lines) < old_count
                 ):
                     new_no_newline = True
                 idx += 1
@@ -308,10 +309,13 @@ def apply_unified_diff(
                 content = line[1:]
                 old_lines.append(content)
                 new_lines.append(content)
+                last_hunk_op = " "
             elif line.startswith("-"):
                 old_lines.append(line[1:])
+                last_hunk_op = "-"
             elif line.startswith("+"):
                 new_lines.append(line[1:])
+                last_hunk_op = "+"
             else:
                 raise PatchApplyError(
                     f"Malformed diff hunk line at diff line {idx + 1}: {line!r}",
@@ -324,7 +328,8 @@ def apply_unified_diff(
         while idx < len(diff_lines) and diff_lines[idx].startswith(
             r"\ No newline at end of file"
         ):
-            new_no_newline = True
+            if last_hunk_op in {"+", " "}:
+                new_no_newline = True
             idx += 1
 
         if len(old_lines) != old_count or len(new_lines) != new_count:
@@ -335,7 +340,13 @@ def apply_unified_diff(
                 line_number=old_start,
             )
 
-        target_idx = 0 if old_start == 0 else old_start - 1
+        if old_start == 0:
+            target_idx = 0
+        elif old_count == 0:
+            # Standard unified diff pure insertion after line `old_start`
+            target_idx = old_start
+        else:
+            target_idx = old_start - 1
         if target_idx < src_cursor:
             raise PatchApplyError(
                 f"Hunk {hunk_index} overlaps or is out of order "

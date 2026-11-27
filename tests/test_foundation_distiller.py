@@ -679,3 +679,52 @@ class TestTracebackDistiller:
         assert "json.loads" in distilled.failing_line
         assert distilled.frames_dropped >= 2
         assert distilled.compression_ratio > 0.3
+
+    def test_exception_group_distillation(self) -> None:
+        tb_grp = (
+            "  + Exception Group Traceback (most recent call last):\n"
+            '  |   File "app.py", line 10, in run_all\n'
+            '  |     raise ExceptionGroup("bad", [ValueError("x")])\n'
+            "  | ExceptionGroup: bad (1 sub-exception)\n"
+            "  +-+---------------- 1 ----------------\n"
+            "    | Traceback (most recent call last):\n"
+            '    |   File "app.py", line 5, in worker\n'
+            '    |     int("abc")\n'
+            "    | ValueError: invalid literal for int() with base 10: 'abc'\n"
+            "    +------------------------------------\n"
+        )
+        distilled = TracebackDistiller.distill(tb_grp)
+        assert distilled.exception_type == "ValueError"
+        assert 'int("abc")' in distilled.failing_line
+        assert distilled.line_number == 5
+
+
+class TestFoundationRegressions:
+    def test_compound_identifiers_preserved_by_stopword_pruner(self) -> None:
+        axiom = truncate_to_axiom_budget(
+            "ValueError negative port number",
+            "validate negative port number",
+            max_tokens=14,
+        )
+        assert "ValueError" in axiom
+        assert count_tokens(axiom) <= 14
+        assert validate_axiom_format(axiom) is True
+
+        camel = truncate_to_axiom_budget(
+            "calling toJSON with rawData",
+            "validate isValid instead",
+            max_tokens=14,
+        )
+        assert "toJSON" in camel
+        assert "isValid" in camel
+
+    def test_unified_diff_pure_insertion_and_no_newline_deletion(self) -> None:
+        import difflib
+
+        a = ["L1\n", "L2\n", "L3\n"]
+        b = ["L1\n", "L2\n", "L3\n", "L4\n"]
+        diff = "".join(difflib.unified_diff(a, b, n=0))
+        assert apply_unified_diff("".join(a), diff) == "L1\nL2\nL3\nL4\n"
+
+        del_diff = "@@ -1,2 +1,1 @@\n a\n-b\n\\ No newline at end of file\n"
+        assert apply_unified_diff("a\nb", del_diff) == "a\n"

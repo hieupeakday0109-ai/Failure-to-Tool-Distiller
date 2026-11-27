@@ -89,7 +89,7 @@ class DualTierLLM:
             model = (
                 self.config.ollama_fast_model
                 if tier == ModelTier.FAST_LOCAL
-                else self.config.ollama_fast_model
+                else (self.config.ollama_frontier_model or self.config.ollama_fast_model)
             )
             content = call_ollama_chat(messages, model=model, config=self.config)
             return content, "ollama", model
@@ -153,7 +153,6 @@ class DualTierLLM:
     def complete(
         self,
         messages: Sequence[Mapping[str, Any]],
-        *,
         purpose: TaskPurpose = TaskPurpose.INITIAL_DRAFT,
         consecutive_failures: int = 0,
     ) -> LLMResponse:

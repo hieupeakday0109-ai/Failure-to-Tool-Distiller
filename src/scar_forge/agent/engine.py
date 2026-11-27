@@ -213,12 +213,15 @@ class ScarForgeEngine:
         schema_warnings: list[str],
     ) -> tuple[str | None, int, int, int, int]:
         """Distill passing solution into an AST-sanitized hot-loaded Skill on FRONTIER."""
-        distill_msgs = [
+        distill_msgs: list[dict[str, str]] = [
             {
                 "role": "system",
                 "content": (
-                    "Refactor passing code into typed standalone SkillDraft JSON: "
-                    "{skill_name, source, docstring, tags, param_schema, test_cases}."
+                    "Refactor passing code into typed standalone SkillDraft JSON only: "
+                    "{skill_name, source, docstring, tags, param_schema, test_cases}. "
+                    "source must define typed top-level def <skill_name>(...) with docstring, "
+                    "allowlisted imports only (no os/sys/subprocess/open/eval/exec/getattr/Path). "
+                    "test_cases items: {\"name\":str,\"kwargs\":dict,\"expected\":val}."
                 ),
             },
             {
@@ -226,47 +229,61 @@ class ScarForgeEngine:
                 "content": f"[TASK]\n{spec.prompt}\n\n[SOLVED_CODE]\n{solved_code}",
             },
         ]
-        resp = self.llm.complete(
-            distill_msgs,
-            purpose=TaskPurpose.SKILL_DISTILLATION,
-            consecutive_failures=0,
-        )
-        self._accumulate_tier(run_usage_acc, resp.tier_used, resp)
+        tot_pt = 0
+        tot_ct = 0
+        tot_tt = 0
+        esc_cnt = 0
 
-        try:
-            parsed = self.protocol.parse(resp.content, self._skill_draft_cls())
-        except ProtocolViolationError:
-            return None, resp.prompt_tokens, resp.completion_tokens, resp.total_tokens, 1
+        for attempt in range(2):
+            resp = self.llm.complete(
+                distill_msgs,
+                purpose=TaskPurpose.SKILL_DISTILLATION,
+                consecutive_failures=0,
+            )
+            self._accumulate_tier(run_usage_acc, resp.tier_used, resp)
+            tot_pt += resp.prompt_tokens
+            tot_ct += resp.completion_tokens
+            tot_tt += resp.total_tokens
+            if resp.escalated:
+                esc_cnt += 1
 
-        if parsed.schema_warning:
-            schema_warnings.extend(parsed.warnings)
-        draft = parsed.data
-        eff_cases = draft.test_cases if draft.test_cases else cases
+            try:
+                parsed = self.protocol.parse(resp.content, self._skill_draft_cls())
+            except ProtocolViolationError as exc:
+                if attempt == 0:
+                    distill_msgs.append(
+                        {"role": "user", "content": f"[PROTOCOL_ERROR] {exc}"}
+                    )
+                    continue
+                return None, tot_pt, tot_ct, tot_tt, esc_cnt
 
-        try:
-            record = self.skill_registry.register_and_reload(
-                source=draft.source,
-                skill_name=draft.skill_name,
-                docstring=draft.docstring,
-                tags=draft.tags or spec.tags,
-                test_cases=eff_cases,
-                param_schema=draft.param_schema or spec.param_schema,
-            )
-            return (
-                record.skill_name,
-                resp.prompt_tokens,
-                resp.completion_tokens,
-                resp.total_tokens,
-                1 if resp.escalated else 0,
-            )
-        except Exception:
-            return (
-                None,
-                resp.prompt_tokens,
-                resp.completion_tokens,
-                resp.total_tokens,
-                1 if resp.escalated else 0,
-            )
+            if parsed.schema_warning:
+                schema_warnings.extend(parsed.warnings)
+            draft = parsed.data
+            eff_cases = draft.test_cases if draft.test_cases else cases
+
+            try:
+                record = self.skill_registry.register_and_reload(
+                    source=draft.source,
+                    skill_name=draft.skill_name,
+                    docstring=draft.docstring,
+                    tags=draft.tags or spec.tags,
+                    test_cases=eff_cases,
+                    param_schema=draft.param_schema or spec.param_schema,
+                )
+                return record.skill_name, tot_pt, tot_ct, tot_tt, esc_cnt
+            except Exception as exc:
+                if attempt == 0:
+                    distill_msgs.append(
+                        {
+                            "role": "user",
+                            "content": f"[FORGE_ERROR] {exc}. Fix and emit valid SkillDraft JSON.",
+                        }
+                    )
+                    continue
+                return None, tot_pt, tot_ct, tot_tt, esc_cnt
+
+        return None, tot_pt, tot_ct, tot_tt, esc_cnt
 
     @staticmethod
     def _skill_draft_cls():
@@ -352,6 +369,9 @@ class ScarForgeEngine:
         t0 = time.perf_counter()
         spec, cases, prompt = self._resolve_task_spec(
             task, use_variant=use_variant, use_reuse_cases=use_reuse_cases
+        )
+        is_adhoc_smoke = not isinstance(task, TaskSpec) and spec.task_id.startswith(
+            "adhoc_"
         )
         run_id = f"run_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:6]}"
         query = f"{prompt} {' '.join(spec.tags)}".strip()
@@ -444,8 +464,9 @@ class ScarForgeEngine:
 
             if action.action == ActionType.CALL_SKILL:
                 sk_name = action.skill_name or ""
+                verify_cases = [] if is_adhoc_smoke else cases
                 ok, acc, sk_err = self._verify_skill_cases(
-                    sk_name, cases, action.skill_args or {}
+                    sk_name, verify_cases, action.skill_args or {}
                 )
                 if ok:
                     success = True
@@ -490,12 +511,17 @@ class ScarForgeEngine:
             elif action.action == ActionType.RUN_CODE:
                 current_code = action.code or ""
             elif action.action == ActionType.FINAL_ANSWER:
-                if action.code:
+                if action.code and action.code.strip():
                     current_code = action.code
                 else:
-                    success = True
-                    accuracy = 1.0
-                    break
+                    # Never trust unverified LLM self-evaluation without sandbox execution
+                    errors_count += 1
+                    consecutive_failures += 1
+                    protocol_hint = (
+                        "FINAL_ANSWER requires verified 'code' or CALL_SKILL; "
+                        "sandbox verification cannot be skipped"
+                    )
+                    continue
 
             sb_res = self.sandbox.execute_code(
                 current_code, cases, entry_fn=spec.entry_fn

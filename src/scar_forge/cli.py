@@ -7,15 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import click
+from pydantic import ValidationError
 
-from scar_forge.agent.engine import ScarForgeEngine
-from scar_forge.benchmark.runner import VALID_BENCHMARK_MODES, BenchmarkRunner
 from scar_forge.config import EngineConfig, configure_utf8_console
-from scar_forge.forge.registry import SkillRegistry
-from scar_forge.memory.retriever import BM25Retriever
-from scar_forge.memory.scar_store import ScarStore
-from scar_forge.ui.console import render_benchmark_summary, render_inspect, render_run_metrics
-from scar_forge.ui.dashboard import create_app
+
+VALID_BENCHMARK_MODES = ("ablation", "standard", "variant")
 
 _PROVIDER_CHOICES = click.Choice(
     ["auto", "local", "ollama", "gemini", "openai"], case_sensitive=False
@@ -30,7 +26,10 @@ def _resolve_config(
     kw: dict[str, Any] = dict(overrides)
     if provider is not None:
         kw["provider"] = provider.lower()
-    return EngineConfig.from_env(data_dir=data_dir, **kw)
+    try:
+        return EngineConfig.from_env(data_dir=data_dir, **kw)
+    except (ValidationError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _load_runs(runs_dir: Path, limit: int = 50) -> list[dict[str, Any]]:
@@ -58,6 +57,9 @@ def cli() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON output.")
 def demo_cmd(provider: str, data_dir: Path | None, as_json: bool) -> None:
     """Run an end-to-end showcase demonstrating cold failure -> Scar -> Skill -> reuse."""
+    from scar_forge.agent.engine import ScarForgeEngine
+    from scar_forge.ui.console import render_run_metrics
+
     cfg = _resolve_config(str(data_dir) if data_dir else None, provider=provider)
     engine = ScarForgeEngine(config=cfg, provider=provider.lower())
 
@@ -104,6 +106,9 @@ def run_cmd(
     as_json: bool,
 ) -> None:
     """Execute a single task through Scar-Forge."""
+    from scar_forge.agent.engine import ScarForgeEngine
+    from scar_forge.ui.console import render_run_metrics
+
     overrides: dict[str, Any] = {}
     if max_attempts is not None:
         overrides["max_attempts"] = max_attempts
@@ -153,6 +158,9 @@ def benchmark_cmd(
     if md_out is not None and md_out.exists() and md_out.is_dir():
         raise click.ClickException(f"--md-out points to an existing directory: {md_out}")
 
+    from scar_forge.benchmark.runner import BenchmarkRunner
+    from scar_forge.ui.console import render_benchmark_summary
+
     cfg = _resolve_config(str(data_dir) if data_dir else None, provider=provider)
     runner = BenchmarkRunner(config=cfg, provider=provider.lower())
     _, payload = runner.run(mode=mode.lower())
@@ -183,6 +191,10 @@ def benchmark_cmd(
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON output.")
 def inspect_cmd(kind: str, data_dir: Path | None, as_json: bool) -> None:
     """Inspect persisted Scars, forged Skills, and execution history."""
+    from scar_forge.forge.registry import SkillRegistry
+    from scar_forge.memory.scar_store import ScarStore
+    from scar_forge.ui.console import render_inspect
+
     cfg = _resolve_config(str(data_dir) if data_dir else None)
     norm_kind = kind.lower()
     scars = ScarStore(cfg).list_scars() if norm_kind in {"all", "scars"} else []
@@ -229,6 +241,11 @@ def search_cmd(
     as_json: bool,
 ) -> None:
     """Run bounded Top-K (clamped 1..5) BM25 retrieval over Scars and Skills."""
+    from scar_forge.forge.registry import SkillRegistry
+    from scar_forge.memory.retriever import BM25Retriever
+    from scar_forge.memory.scar_store import ScarStore
+    from scar_forge.ui.console import render_inspect
+
     cfg = _resolve_config(str(data_dir) if data_dir else None)
     retriever = BM25Retriever(cfg)
     clamped_k = retriever.clamp_top_k(top_k, cfg.top_k_scars)
@@ -269,6 +286,8 @@ def search_cmd(
 @click.option("--data-dir", type=click.Path(path_type=Path), default=None)
 def dashboard_cmd(host: str, port: int, data_dir: Path | None) -> None:
     """Launch the local Flask web telemetry dashboard."""
+    from scar_forge.ui.dashboard import create_app
+
     cfg = _resolve_config(
         str(data_dir) if data_dir else None,
         dashboard_host=host,

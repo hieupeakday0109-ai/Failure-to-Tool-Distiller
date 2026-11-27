@@ -131,6 +131,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
   </main>
   <script>
+    function esc(v) {
+      return String(v ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      })[c]);
+    }
     async function refresh() {
       const [st, sc, sk, bm] = await Promise.all([
         fetch('/api/state').then(r => r.json()),
@@ -146,25 +155,25 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         ['Skill Reuses', st.total_skill_reuses],
         ['Recorded Runs', st.runs_count]
       ].map(([k, v]) => (
-        `<div class="card"><div class="kpi-label">${k}</div>` +
-        `<div class="kpi-val">${v}</div></div>`
+        `<div class="card"><div class="kpi-label">${esc(k)}</div>` +
+        `<div class="kpi-val">${esc(v)}</div></div>`
       )).join('');
 
       document.getElementById('scars-body').innerHTML = (sc.scars || []).map(s => (
-        `<tr><td><code>${s.scar_id}</code></td>` +
-        `<td><code>${s.axiom}</code></td>` +
-        `<td>${s.token_count}</td>` +
-        `<td>${s.occurrence_count}</td>` +
-        `<td><span class="pill">${s.prevented_count}</span></td>` +
-        `<td class="muted">${(s.tags || []).join(', ')}</td></tr>`
+        `<tr><td><code>${esc(s.scar_id)}</code></td>` +
+        `<td><code>${esc(s.axiom)}</code></td>` +
+        `<td>${esc(s.token_count)}</td>` +
+        `<td>${esc(s.occurrence_count)}</td>` +
+        `<td><span class="pill">${esc(s.prevented_count)}</span></td>` +
+        `<td class="muted">${esc((s.tags || []).join(', '))}</td></tr>`
       )).join('') || '<tr><td colspan="6" class="muted">No Scars recorded yet.</td></tr>';
 
       document.getElementById('skills-body').innerHTML = (sk.skills || []).map(x => (
-        `<tr><td><code>${x.skill_name}</code></td>` +
-        `<td>v${x.version}</td>` +
-        `<td><span class="pill">${x.reuse_count}</span></td>` +
+        `<tr><td><code>${esc(x.skill_name)}</code></td>` +
+        `<td>v${esc(x.version)}</td>` +
+        `<td><span class="pill">${esc(x.reuse_count)}</span></td>` +
         `<td>AST+Sandbox</td>` +
-        `<td>${x.docstring}</td></tr>`
+        `<td>${esc(x.docstring)}</td></tr>`
       )).join('') || '<tr><td colspan="5" class="muted">No Skills forged yet.</td></tr>';
 
       if (bm && bm.epoch_1 && bm.epoch_3) {
@@ -178,16 +187,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           ['Epoch 2 (Scar-Guided)', bm.epoch_2],
           ['Epoch 3 (Skill-Reuse)', bm.epoch_3]
         ].map(([lbl, ep]) => {
-          const pct = Math.round((ep.total_tokens / maxTok) * 100);
+          const pct = Math.max(0, Math.min(100, Math.round((ep.total_tokens / maxTok) * 100)));
           return (
-            `<div class="bar-row"><div>${lbl}</div>` +
+            `<div class="bar-row"><div>${esc(lbl)}</div>` +
             `<div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>` +
-            `<div>${ep.total_tokens} tok</div></div>`
+            `<div>${esc(ep.total_tokens)} tok</div></div>`
           );
         }).join('');
         const redPct = (Number(bm.token_reduction_epoch3_vs_epoch1 || 0) * 100).toFixed(1);
         document.getElementById('bench-box').innerHTML = (
-          rows + `<p class="pill">Epoch 3 Token Reduction: ${redPct}%</p>`
+          rows + `<p class="pill">Epoch 3 Token Reduction: ${esc(redPct)}%</p>`
         );
       } else {
         document.getElementById('bench-box').textContent = (

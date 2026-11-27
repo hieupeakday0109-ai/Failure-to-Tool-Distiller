@@ -209,3 +209,84 @@ class TestSandboxRunnerUnit:
         )
         assert res_env.passed is True
         assert os.environ.get("GEMINI_API_KEY") == "secret-gemini-999"
+
+    def test_import_guard_blocks_name_and_globals_bypass(self, tmp_path: Path) -> None:
+        runner = SandboxRunner(EngineConfig(data_dir=tmp_path))
+        for mod in ("socket", "ctypes", "shutil"):
+            code = f"__name__ = 'innocent'\nimport {mod}\ndef pwn() -> int:\n    return 1\n"
+            res = runner.execute_code(code, [{"kwargs": {}, "expected": 1}], entry_fn="pwn")
+            assert res.passed is False
+
+        g_bypass = "def pwn() -> str:\n    return __import__('socket', {}).__name__\n"
+        assert (
+            runner.execute_code(
+                g_bypass, [{"kwargs": {}, "expected": "socket"}], entry_fn="pwn"
+            ).passed
+            is False
+        )
+
+        c_bypass = (
+            "def pwn() -> str:\n"
+            "    return __import__.__closure__[0].cell_contents('socket').__name__\n"
+        )
+        assert (
+            runner.execute_code(
+                c_bypass, [{"kwargs": {}, "expected": "socket"}], entry_fn="pwn"
+            ).passed
+            is False
+        )
+
+        pd_code = (
+            "import pandas as pd\n"
+            "def ok(x: int) -> int:\n"
+            "    return int(pd.DataFrame([{'a': x}])['a'].iloc[0])\n"
+        )
+        assert (
+            runner.execute_code(
+                pd_code, [{"kwargs": {"x": 7}, "expected": 7}], entry_fn="ok"
+            ).passed
+            is True
+        )
+
+    def test_adversarial_unwraps_optional_dict_hint(self, tmp_path: Path) -> None:
+        runner = SandboxRunner(EngineConfig(data_dir=tmp_path))
+        src = (
+            "from typing import Any, Optional\n\n"
+            "def get_val(d: Optional[dict[str, Any]]) -> int:\n"
+            '    """Read key v safely."""\n'
+            "    if d is None:\n"
+            "        return 0\n"
+            "    return int(d.get('v', 0))\n"
+        )
+        res = runner.verify_skill_adversarial(
+            src, "get_val", [{"kwargs": {"d": {"v": 4}}, "expected": 4}]
+        )
+        assert res.passed is True
+
+
+class TestScarStoreRegressions:
+    def test_low_token_budget_and_raise_exception_fallback(self, tmp_path: Path) -> None:
+        store6 = ScarStore(EngineConfig(data_dir=tmp_path / "low", max_scar_tokens=6))
+        err = DistilledError(
+            exception_type="ValueError",
+            core_message="bad int literal",
+            failing_line="int(raw)",
+            line_number=2,
+        )
+        scar, created = store6.record_failure(err, "int(raw)", ["parse"])
+        assert created is True
+        assert scar.token_count <= 6
+        assert validate_axiom_format(scar.axiom, max_tokens=6)
+
+        store14 = ScarStore(EngineConfig(data_dir=tmp_path / "std"))
+        err_raise = DistilledError(
+            exception_type="ValueError",
+            core_message="negative port number",
+            failing_line="raise ValueError('negative port')",
+            line_number=5,
+        )
+        scar_r, _ = store14.record_failure(
+            err_raise, "raise ValueError('negative port')", ["config"]
+        )
+        assert "guard ValueError ValueError" not in scar_r.axiom
+        assert validate_axiom_format(scar_r.axiom)

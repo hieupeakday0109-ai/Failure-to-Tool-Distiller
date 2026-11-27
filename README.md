@@ -102,28 +102,28 @@ stateDiagram-v2
 Executed via `python scripts/run_benchmark.py --provider local --mode variant` across 8 real-world Python pitfall domains (`pandas_concat`, `iso_utc_delta`, `csv_bom_parse`, `json_strict_rfc8259`, `webhook_bool_coerce`, `semver_numeric_sort`, `html_text_extract`, `posix_path_guard`):
 
 - **Tokenizer:** `deterministic_subword_regex_v1`
-- **Epoch 3 vs Epoch 1 Token Reduction:** **79.3%**
+- **Epoch 3 vs Epoch 1 Token Reduction:** **80.2%**
 - **Epoch 2 Repeated Error Reduction:** **100.0%**
-- **Epoch 3 vs Epoch 1 Speedup:** **47.62x**
+- **Epoch 3 vs Epoch 1 Speedup:** **47.00x**
 
 | Epoch | Passed | Accuracy | Total Tokens | Avg Tokens/Task | Total Errors | Repeated Errors | Duration (ms) | Active Scars | Active Skills | Skill Reuses |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Epoch 1 (Cold Start) | 8/8 | 100.0% | 12,143 | 1517.9 | 8 | 0 | 20,701.9 | 8 | 8 | 0 |
-| Epoch 2 (Scar-Guided) | 8/8 | 100.0% | 3,322 | 415.2 | 0 | 0 | 8,193.0 | 8 | 8 | 0 |
-| Epoch 3 (Skill-Reuse) | 8/8 | 100.0% | 2,513 | 314.1 | 0 | 0 | 434.7 | 8 | 8 | 8 |
+| Epoch 1 (Cold Start) | 8/8 | 100.0% | 12,690 | 1586.2 | 8 | 0 | 22,219.2 | 8 | 8 | 0 |
+| Epoch 2 (Scar-Guided) | 8/8 | 100.0% | 3,326 | 415.8 | 0 | 0 | 6,782.7 | 8 | 8 | 0 |
+| Epoch 3 (Skill-Reuse) | 8/8 | 100.0% | 2,507 | 313.4 | 0 | 0 | 472.7 | 8 | 8 | 8 |
 
 ### Per-Task Progression
 
 | Task ID | Epoch 1 Tokens (Errors) | Epoch 2 Tokens (Repeated) | Epoch 3 Tokens (Skill Reused) | Token Savings (E3 vs E1) |
 | --- | ---: | ---: | ---: | ---: |
-| `pandas_concat` | 1,304 (1) | 368 (0) | 377 (`merge_dataframe_records`) | 71.1% |
-| `iso_utc_delta` | 1,432 (1) | 370 (0) | 378 (`compute_utc_deltas`) | 73.6% |
-| `csv_bom_parse` | 1,778 (1) | 485 (0) | 374 (`parse_bom_semicolon_csv`) | 79.0% |
-| `json_strict_rfc8259` | 1,675 (1) | 484 (0) | 311 (`serialize_strict_json`) | 81.4% |
-| `webhook_bool_coerce` | 1,316 (1) | 337 (0) | 320 (`coerce_webhook_booleans`) | 75.7% |
-| `semver_numeric_sort` | 1,233 (1) | 310 (0) | 255 (`sort_semver_tags`) | 79.3% |
-| `html_text_extract` | 1,696 (1) | 485 (0) | 248 (`extract_html_text`) | 85.4% |
-| `posix_path_guard` | 1,709 (1) | 483 (0) | 250 (`resolve_safe_posix_path`) | 85.4% |
+| `pandas_concat` | 1,372 (1) | 368 (0) | 377 (`merge_dataframe_records`) | 72.5% |
+| `iso_utc_delta` | 1,506 (1) | 370 (0) | 378 (`compute_utc_deltas`) | 74.9% |
+| `csv_bom_parse` | 1,843 (1) | 485 (0) | 371 (`parse_bom_semicolon_csv`) | 79.9% |
+| `json_strict_rfc8259` | 1,738 (1) | 484 (0) | 311 (`serialize_strict_json`) | 82.1% |
+| `webhook_bool_coerce` | 1,381 (1) | 337 (0) | 317 (`coerce_webhook_booleans`) | 77.0% |
+| `semver_numeric_sort` | 1,301 (1) | 310 (0) | 255 (`sort_semver_tags`) | 80.4% |
+| `html_text_extract` | 1,772 (1) | 489 (0) | 248 (`extract_html_text`) | 86.0% |
+| `posix_path_guard` | 1,777 (1) | 483 (0) | 250 (`resolve_safe_posix_path`) | 85.9% |
 
 ---
 
@@ -157,8 +157,8 @@ python scripts/run_benchmark.py --provider local --mode variant --out bench.json
 # Run full test suite (unit + 4-tier E2E + static hygiene)
 pytest
 
-# Run linter
-ruff check src tests scripts
+# Run linter on source, scripts, and unit tests
+ruff check src scripts tests/test_static_hygiene.py tests/test_memory_sandbox.py tests/test_forge_llm_engine.py tests/test_benchmark_cli_ui.py
 ```
 
 ---

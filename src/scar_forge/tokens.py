@@ -245,7 +245,11 @@ class TokenCounter:
         last_end = 0
         dropped = 0
         for tok, start, end in spans:
-            if tok.lower() in _STOPWORDS and (len(spans) - dropped) > 1:
+            is_standalone = (
+                (start == 0 or not clause[start - 1].isalnum())
+                and (end == len(clause) or not clause[end].isalnum())
+            )
+            if is_standalone and tok.lower() in _STOPWORDS and (len(spans) - dropped) > 1:
                 dropped += 1
                 last_end = end
                 continue
@@ -308,13 +312,17 @@ class TokenCounter:
         if self.count_tokens(a) >= self.count_tokens(u):
             a = self._drop_stopwords(a)
             candidate = f"[AVOID] {a} -> [USE] {u}"
-            if self.count_tokens(candidate) <= limit:
+            if self.count_tokens(candidate) <= limit and self.validate_axiom_format(
+                candidate, limit
+            ):
                 return candidate
             u = self._drop_stopwords(u)
         else:
             u = self._drop_stopwords(u)
             candidate = f"[AVOID] {a} -> [USE] {u}"
-            if self.count_tokens(candidate) <= limit:
+            if self.count_tokens(candidate) <= limit and self.validate_axiom_format(
+                candidate, limit
+            ):
                 return candidate
             a = self._drop_stopwords(a)
 

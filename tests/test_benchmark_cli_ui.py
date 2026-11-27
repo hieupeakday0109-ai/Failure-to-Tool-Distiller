@@ -105,3 +105,21 @@ class TestDashboardUnit:
 
             r_404 = client.get("/api/unknown")
             assert r_404.status_code == 404
+
+    def test_dashboard_escapes_html_in_js_and_cli_rejects_bad_port(
+        self, tmp_path: Path
+    ) -> None:
+        app = create_app(EngineConfig(data_dir=tmp_path))
+        app.config["TESTING"] = True
+        with app.test_client() as client:
+            html = client.get("/").get_data(as_text=True)
+            assert "function esc(" in html
+            assert "${esc(s.axiom)}" in html
+
+        runner = CliRunner()
+        bad_port = runner.invoke(
+            cli,
+            ["dashboard", "--port", "80", "--data-dir", str(tmp_path)],
+        )
+        assert bad_port.exit_code != 0
+        assert "Traceback" not in bad_port.output

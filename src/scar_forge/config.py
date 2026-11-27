@@ -42,6 +42,7 @@ class EngineConfig(BaseModel):
     max_attempts: int = Field(default=5, ge=1, le=20)
     ollama_base_url: str = "http://localhost:11434"
     ollama_fast_model: str = "qwen2.5-coder:7b"
+    ollama_frontier_model: str | None = None
     gemini_fast_model: str = "gemini-2.5-flash"
     gemini_frontier_model: str = "gemini-2.5-pro"
     openai_base_url: str = "https://api.openai.com/v1"
@@ -50,7 +51,7 @@ class EngineConfig(BaseModel):
     llm_timeout_s: float = Field(default=30.0, gt=0.0)
 
     # Adversarial sandbox limits
-    sandbox_timeout_s: float = Field(default=15.0, gt=0.1, le=60.0)
+    sandbox_timeout_s: float = Field(default=30.0, gt=0.1, le=60.0)
     sandbox_memory_mb: int = Field(default=256, ge=32, le=4096)
     sandbox_max_processes: int = Field(default=2, ge=1, le=16)
     enable_win32_job_object: bool = True
@@ -113,6 +114,10 @@ class EngineConfig(BaseModel):
         env_ollama = os.getenv("OLLAMA_HOST")
         if env_ollama:
             env_values["ollama_base_url"] = env_ollama.strip()
+
+        env_ollama_frontier = os.getenv("OLLAMA_FRONTIER_MODEL")
+        if env_ollama_frontier:
+            env_values["ollama_frontier_model"] = env_ollama_frontier.strip()
 
         env_esc = os.getenv("SCAR_FORGE_ESCALATION_THRESHOLD")
         if env_esc:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from scar_forge.config import EngineConfig
-from scar_forge.models import DistilledError, ScarRecord
+from scar_forge.models import AxiomDraft, DistilledError, ScarRecord, TaskPurpose
 from scar_forge.tokens import (
     count_tokens,
     truncate_rule_to_budget,
@@ -180,6 +180,13 @@ class ScarStore:
             if tmp_path is not None and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _fit_axiom(avoid: str, use: str, budget: int) -> str:
+        if budget >= 9:
+            return truncate_to_axiom_budget(avoid, use, max_tokens=budget)
+        rule_text = f"avoid {avoid}; use {use}".strip()
+        return truncate_rule_to_budget(rule_text, max_tokens=budget)
+
     def _synthesize_axiom(
         self,
         error: DistilledError,
@@ -189,6 +196,7 @@ class ScarStore:
         avoid_hint: str = "",
         use_hint: str = "",
         rule_hint: str = "",
+        llm: Any | None = None,
     ) -> str:
         budget = min(14, self.config.max_scar_tokens)
 
@@ -198,11 +206,44 @@ class ScarStore:
                 return axiom
 
         if avoid_hint.strip() or use_hint.strip():
-            return truncate_to_axiom_budget(
+            return self._fit_axiom(
                 avoid_hint or error.exception_type,
                 use_hint or "handle safely",
-                max_tokens=budget,
+                budget,
             )
+
+        if llm is not None and getattr(llm, "provider", "local") != "local":
+            try:
+                from scar_forge.protocol import ProtocolParser
+
+                msgs = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Distill runtime failure into JSON AxiomDraft only: "
+                            '{"avoid":"<bad pattern>","use":"<safe fix>","tags":["..."]}. '
+                            "Keep clauses ultra-telegraphic (<15 tokens total)."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{error.format_for_prompt()}\n"
+                            f"[CODE]\n{(code or '')[:400]}"
+                        ),
+                    },
+                ]
+                resp = llm.complete(
+                    msgs,
+                    purpose=TaskPurpose.SCAR_DISTILLATION,
+                    consecutive_failures=0,
+                )
+                draft = ProtocolParser(allow_fence_fallback=True).parse(
+                    resp.content, AxiomDraft
+                ).data
+                return self._fit_axiom(draft.avoid, draft.use, budget)
+            except Exception:
+                pass
 
         combined = " ".join(
             [
@@ -218,7 +259,7 @@ class ScarStore:
         if ("dataframe" in combined or "pandas" in combined or "pd." in combined) and (
             "append" in combined
         ):
-            return truncate_to_axiom_budget("DataFrame.append", "pd.concat", max_tokens=budget)
+            return self._fit_axiom("DataFrame.append", "pd.concat", budget)
 
         if (
             "offset-naive" in combined
@@ -226,9 +267,7 @@ class ScarStore:
             or ("naive" in combined and "aware" in combined)
             or ("naive" in combined and "datetime" in combined)
         ):
-            return truncate_to_axiom_budget(
-                "naive datetime", "timezone.utc aware", max_tokens=budget
-            )
+            return self._fit_axiom("naive datetime", "timezone.utc aware", budget)
 
         if (
             "bom" in combined
@@ -237,9 +276,7 @@ class ScarStore:
             or ("utf-8-sig" in combined)
             or ("unicodedecodeerror" in combined and "csv" in combined)
         ):
-            return truncate_to_axiom_budget(
-                "plain csv", "utf8sig strip BOM", max_tokens=budget
-            )
+            return self._fit_axiom("plain csv", "utf8sig strip BOM", budget)
 
         if (
             "allow_nan" in combined
@@ -247,41 +284,29 @@ class ScarStore:
             or ("nan" in combined and "json" in combined)
             or ("decimal" in combined and "json" in combined)
         ):
-            return truncate_to_axiom_budget(
-                "json nan", "strict allow_nan", max_tokens=budget
-            )
+            return self._fit_axiom("json nan", "strict allow_nan", budget)
 
         if (
             "bool(" in combined
             and ("'false'" in combined or "false" in combined or "webhook" in combined)
         ) or ("invalid literal for int()" in combined and "'false'" in combined):
-            return truncate_to_axiom_budget(
-                "bool(str)", "parse_bool_strict", max_tokens=budget
-            )
+            return self._fit_axiom("bool(str)", "parse_bool_strict", budget)
 
         if "semver" in combined or ("1.10" in combined and "1.2" in combined):
-            return truncate_to_axiom_budget(
-                "string sort semver", "int tuple key", max_tokens=budget
-            )
+            return self._fit_axiom("string sort semver", "int tuple key", budget)
 
         if "html" in combined and (
             "re.sub" in combined or "regex" in combined or "htmlparser" in combined
         ):
-            return truncate_to_axiom_budget(
-                "regex strip html", "HTMLParser", max_tokens=budget
-            )
+            return self._fit_axiom("regex strip html", "HTMLParser", budget)
 
         if "traversal" in combined or "pureposixpath" in combined or (
             "os.path.join" in combined and "path" in combined
         ):
-            return truncate_to_axiom_budget(
-                "raw path.join", "PurePosixPath", max_tokens=budget
-            )
+            return self._fit_axiom("raw path.join", "PurePosixPath", budget)
 
         if "zerodivisionerror" in combined or "division by zero" in combined:
-            return truncate_to_axiom_budget(
-                "unguarded / 0", "check denom != 0", max_tokens=budget
-            )
+            return self._fit_axiom("unguarded / 0", "check denom != 0", budget)
 
         # Generic telegraphic extraction from failing line / code / message
         snippet = (error.failing_line or code or "").strip()
@@ -289,13 +314,19 @@ class ScarStore:
         if call_match:
             call_sym = call_match.group(1)
             short_sym = call_sym.split(".")[-1]
-            avoid_clause = call_sym
-            use_clause = f"guard {error.exception_type} {short_sym}"
-            candidate = truncate_to_axiom_budget(avoid_clause, use_clause, max_tokens=budget)
-            if count_tokens(candidate) <= budget and validate_axiom_format(
-                candidate, max_tokens=budget
-            ):
-                return candidate
+            is_exception_ctor = (
+                short_sym == error.exception_type
+                or short_sym.endswith(("Error", "Exception", "Warning", "Interrupt", "Exit"))
+                or bool(re.search(rf"\braise\s+{re.escape(call_sym)}\s*\(", snippet))
+            )
+            if not is_exception_ctor:
+                avoid_clause = call_sym
+                use_clause = f"guard {error.exception_type} {short_sym}"
+                candidate = self._fit_axiom(avoid_clause, use_clause, budget)
+                if count_tokens(candidate) <= budget and validate_axiom_format(
+                    candidate, max_tokens=budget
+                ):
+                    return candidate
 
         msg_words = [
             w
@@ -305,7 +336,7 @@ class ScarStore:
         cue_phrase = " ".join(msg_words[:3]) if msg_words else error.exception_type
         avoid_clause = f"{error.exception_type} {cue_phrase}".strip()
         use_clause = f"validate {cue_phrase}" if cue_phrase else "validate input"
-        return truncate_to_axiom_budget(avoid_clause, use_clause, max_tokens=budget)
+        return self._fit_axiom(avoid_clause, use_clause, budget)
 
     @staticmethod
     def _compute_exact_signature(
@@ -321,7 +352,9 @@ class ScarStore:
     def _jaccard_tokens(
         exc_type: str, core_msg: str, failing_line: str, axiom: str
     ) -> set[str]:
-        combined = " ".join([exc_type, core_msg, failing_line, axiom])
+        norm_msg = _normalize_text_for_sig(core_msg)
+        norm_line = _normalize_text_for_sig(failing_line)
+        combined = " ".join([exc_type, norm_msg, norm_line, axiom])
         return _whole_token_set(combined) - {"avoid", "use", "rule"}
 
     def record_failure(
@@ -330,6 +363,7 @@ class ScarStore:
         code: str = "",
         tags: Sequence[str] | None = None,
         *,
+        llm: Any | None = None,
         avoid_hint: str = "",
         use_hint: str = "",
         rule_hint: str = "",
@@ -346,26 +380,28 @@ class ScarStore:
             avoid_hint=avoid_hint,
             use_hint=use_hint,
             rule_hint=rule_hint,
+            llm=llm,
         )
         tok_count = count_tokens(axiom)
         if tok_count > self.config.max_scar_tokens or not validate_axiom_format(
             axiom, max_tokens=self.config.max_scar_tokens
         ):
-            axiom = truncate_to_axiom_budget(
-                error.exception_type, "validate input", max_tokens=self.config.max_scar_tokens
+            axiom = self._fit_axiom(
+                error.exception_type, "validate input", self.config.max_scar_tokens
             )
             tok_count = count_tokens(axiom)
 
         exact_sig = self._compute_exact_signature(error, code)
         norm_core = _normalize_text_for_sig(error.core_message)
-        new_tokens = self._jaccard_tokens(
-            error.exception_type, error.core_message, error.failing_line or code, axiom
-        )
+        snippet = (error.failing_line or code or "")[:300]
         cue = context_cue.strip() or " ".join(
             part
             for part in (error.exception_type, error.core_message[:80], " ".join(clean_tags))
             if part
         ).strip()
+        new_tokens = self._jaccard_tokens(
+            error.exception_type, cue, snippet, axiom
+        )
         now = _utc_now()
         now_iso = now.isoformat()
 
@@ -446,7 +482,6 @@ class ScarStore:
                     ).hexdigest()[:6]
                     scar_id = f"scar_{exact_sig[:8]}_{suffix}"
 
-                snippet = (error.failing_line or code or "")[:300]
                 conn.execute(
                     """
                     INSERT INTO scars (

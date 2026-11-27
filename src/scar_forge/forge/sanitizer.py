@@ -77,6 +77,15 @@ BLOCKED_BUILTINS: frozenset[str] = frozenset(
         "__package__",
         "__name__",
         "memoryview",
+        "attrgetter",
+        "methodcaller",
+    }
+)
+
+BLOCKED_UNSAFE_ATTRS: frozenset[str] = frozenset(
+    {
+        "read_pickle",
+        "to_pickle",
     }
 )
 
@@ -203,12 +212,19 @@ class ASTGuard:
                         f"Blocked import from '{mod}' at line {stmt.lineno}"
                     )
                 else:
-                    if mod == "pathlib":
-                        for alias in stmt.names:
-                            if alias.name == "*" or alias.name in BLOCKED_PATHLIB_MEMBERS:
-                                violations.append(
-                                    f"Blocked pathlib member '{alias.name}' at line {stmt.lineno}"
-                                )
+                    for alias in stmt.names:
+                        if alias.name == "*":
+                            violations.append(
+                                f"Star import from '{mod}' disallowed at line {stmt.lineno}"
+                            )
+                        elif alias.name in BLOCKED_BUILTINS or alias.name in BLOCKED_UNSAFE_ATTRS:
+                            violations.append(
+                                f"Blocked imported symbol '{alias.name}' at line {stmt.lineno}"
+                            )
+                        elif mod == "pathlib" and alias.name in BLOCKED_PATHLIB_MEMBERS:
+                            violations.append(
+                                f"Blocked pathlib member '{alias.name}' at line {stmt.lineno}"
+                            )
                     imports_used.append(mod)
             elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
                 continue
@@ -221,6 +237,24 @@ class ASTGuard:
                 violations.append(
                     f"Disallowed top-level statement {type(stmt).__name__} at line {stmt.lineno}"
                 )
+
+        # Identify legitimate super().__init__(...) attribute nodes inside ClassDef methods
+        allowed_super_inits: set[int] = set()
+        class_method_ids: set[int] = set()
+        for cls_node in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            for sub in ast.walk(cls_node):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    class_method_ids.add(id(sub))
+                    for call_node in ast.walk(sub):
+                        if (
+                            isinstance(call_node, ast.Call)
+                            and isinstance(call_node.func, ast.Attribute)
+                            and call_node.func.attr == "__init__"
+                            and isinstance(call_node.func.value, ast.Call)
+                            and isinstance(call_node.func.value.func, ast.Name)
+                            and call_node.func.value.func.id == "super"
+                        ):
+                            allowed_super_inits.add(id(call_node.func))
 
         # Deep walk across entire AST for nested imports, dangerous builtins, dunder escapes, stubs
         _branch_or_scope = (
@@ -261,17 +295,25 @@ class ASTGuard:
                     )
 
             elif isinstance(parent, ast.Attribute):
-                if parent.attr in BLOCKED_BUILTINS or parent.attr in _blocked_path_attrs:
+                if (
+                    parent.attr in BLOCKED_BUILTINS
+                    or parent.attr in BLOCKED_UNSAFE_ATTRS
+                    or parent.attr in _blocked_path_attrs
+                ):
                     violations.append(
                         f"Blocked attribute '.{parent.attr}' at line {parent.lineno}"
                     )
-                if parent.attr.startswith("__") and parent.attr.endswith("__"):
+                if (
+                    parent.attr.startswith("__")
+                    and parent.attr.endswith("__")
+                    and id(parent) not in allowed_super_inits
+                ):
                     violations.append(
                         f"Blocked dunder attribute '.{parent.attr}' at line {parent.lineno}"
                     )
 
             elif isinstance(parent, ast.Call):
-                # Allow super().__init__ only via normal helper methods; block builtins
+                # Block dangerous builtins and 3-arg dynamic type() / allow_pickle=True
                 if (
                     isinstance(parent.func, ast.Name)
                     and parent.func.id in BLOCKED_BUILTINS
@@ -279,8 +321,29 @@ class ASTGuard:
                     violations.append(
                         f"Blocked builtin call '{parent.func.id}()' at line {parent.lineno}"
                     )
+                elif (
+                    isinstance(parent.func, ast.Name)
+                    and parent.func.id == "type"
+                    and (len(parent.args) != 1 or len(parent.keywords) > 0)
+                ):
+                    violations.append(
+                        f"Blocked dynamic 3-arg type() call at line {parent.lineno}"
+                    )
+                for kw in parent.keywords:
+                    if kw.arg == "allow_pickle" and not (
+                        isinstance(kw.value, ast.Constant) and kw.value.value is False
+                    ):
+                        violations.append(
+                            f"Blocked allow_pickle argument at line {parent.lineno}"
+                        )
 
             elif isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if parent.name.startswith("__") and parent.name.endswith("__") and not (
+                    id(parent) in class_method_ids and parent.name == "__init__"
+                ):
+                    violations.append(
+                        f"Blocked dunder function '{parent.name}' at line {parent.lineno}"
+                    )
                 fn_body = list(parent.body)
                 if fn_body and _is_docstring(fn_body[0]):
                     fn_body = fn_body[1:]

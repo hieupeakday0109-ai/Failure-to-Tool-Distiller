@@ -42,7 +42,9 @@ import importlib.util
 import json
 import math
 import os
+import site
 import sys
+import sysconfig
 import time
 import traceback
 import tracemalloc
@@ -81,6 +83,71 @@ _BLOCKED_PREFIXES = (
     "importlib.",
     "concurrent.futures.process",
 )
+
+_HARNESS_NORM = os.path.normcase(os.path.abspath(__file__))
+_TRUSTED_PREFIXES = tuple(
+    sorted(
+        {
+            os.path.normcase(os.path.abspath(p))
+            for p in (
+                sysconfig.get_path("stdlib"),
+                sysconfig.get_path("platstdlib"),
+                sysconfig.get_path("purelib"),
+                sysconfig.get_path("platlib"),
+                *(site.getsitepackages() if hasattr(site, "getsitepackages") else ()),
+            )
+            if p
+        }
+    )
+)
+_BLOCKED_AUDIT_EVENTS = frozenset({
+    "subprocess.Popen",
+    "os.system",
+    "os.spawn",
+    "os.exec",
+    "os.fork",
+    "os.forkpty",
+    "socket.connect",
+    "socket.bind",
+    "winreg.OpenKey",
+    "winreg.SetValue",
+    "winreg.CreateKey",
+    "winreg.DeleteKey",
+    "winreg.DeleteValue",
+})
+
+
+def _is_blocked_module(name):
+    if not name:
+        return False
+    root = name.split(".", 1)[0]
+    return root in _BLOCKED_MODULES or any(name.startswith(p) for p in _BLOCKED_PREFIXES)
+
+
+def _is_trusted_caller(frame, target_norm):
+    f = frame
+    while f is not None:
+        cf = f.f_code.co_filename or ""
+        if (
+            cf.startswith("<frozen importlib")
+            or "importlib/_bootstrap" in cf
+            or "importlib\\_bootstrap" in cf
+        ):
+            f = f.f_back
+            continue
+        if not cf.startswith("<") and os.path.normcase(os.path.abspath(cf)) == _HARNESS_NORM:
+            f = f.f_back
+            continue
+        if cf.startswith("<"):
+            return False
+        cf_norm = os.path.normcase(os.path.abspath(cf))
+        if cf_norm == target_norm:
+            return False
+        return any(
+            cf_norm == pref or cf_norm.startswith(pref + os.sep)
+            for pref in _TRUSTED_PREFIXES
+        )
+    return False
 
 
 def _decode_val(obj):
@@ -157,16 +224,15 @@ def _values_equal(actual, expected):
     return actual == expected
 
 
-def _install_guards():
+def _install_guards(code_path):
+    target_norm = os.path.normcase(os.path.abspath(code_path))
     orig_import = builtins.__import__
 
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        caller_name = globals.get("__name__", "") if isinstance(globals, dict) else ""
-        root = name.split(".", 1)[0]
-        if caller_name == "scar_sandbox_target" and (
-            root in _BLOCKED_MODULES or any(name.startswith(p) for p in _BLOCKED_PREFIXES)
-        ):
-            raise ImportError(f"Blocked unsafe module '{name}' in sandbox")
+        if _is_blocked_module(name):
+            caller_frame = sys._getframe(1)
+            if not _is_trusted_caller(caller_frame, target_norm):
+                raise ImportError(f"Blocked unsafe module '{name}' in sandbox")
         return orig_import(name, globals, locals, fromlist, level)
 
     builtins.__import__ = _guarded_import
@@ -179,6 +245,21 @@ def _install_guards():
                  "execlpe", "execv", "execve", "execvp", "execvpe"):
         if hasattr(os, attr):
             setattr(os, attr, _blocked_exec)
+
+    def _audit_hook(event, args):
+        if event == "import" and args:
+            mod_name = str(args[0])
+            if _is_blocked_module(mod_name):
+                try:
+                    caller_frame = sys._getframe(1)
+                except ValueError:
+                    caller_frame = None
+                if not _is_trusted_caller(caller_frame, target_norm):
+                    raise ImportError(f"Blocked unsafe module '{mod_name}' in sandbox")
+        elif event in _BLOCKED_AUDIT_EVENTS:
+            raise PermissionError(f"Blocked sandbox operation: {event}")
+
+    sys.addaudithook(_audit_hook)
 
 
 def main():
@@ -193,7 +274,17 @@ def main():
     allow_explicit_raises = bool(payload.get("allow_explicit_raises", False))
     result_path = payload["result_path"]
 
-    _install_guards()
+    # Isolate sys.path from cwd / script work_dir like -I without extra startup cost
+    code_dir = os.path.normcase(os.path.abspath(os.path.dirname(code_path)))
+    cwd_norm = os.path.normcase(os.path.abspath(os.getcwd()))
+    sys.path[:] = [
+        p
+        for p in sys.path
+        if p not in ("", ".")
+        and os.path.normcase(os.path.abspath(p)) not in (code_dir, cwd_norm)
+    ]
+
+    _install_guards(code_path)
 
     try:
         mod_spec = importlib.util.spec_from_file_location("scar_sandbox_target", code_path)
@@ -453,15 +544,16 @@ def _build_sanitized_env(work_dir: Path) -> dict[str, str]:
 def _kill_process_tree(pid: int) -> None:
     try:
         parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
+        children = parent.children(recursive=True)
+    except psutil.Error:
         return
-    children = parent.children(recursive=True)
     for child in children:
         with contextlib.suppress(psutil.Error):
             child.kill()
     with contextlib.suppress(psutil.Error):
         parent.kill()
-    psutil.wait_procs([parent, *children], timeout=2.0)
+    with contextlib.suppress(psutil.Error):
+        psutil.wait_procs([parent, *children], timeout=2.0)
 
 
 class SandboxRunner:
@@ -575,7 +667,7 @@ class SandboxRunner:
 
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, str(harness_path), str(spec_path)],
+                    [sys.executable, "-s", "-E", "-B", str(harness_path), str(spec_path)],
                     cwd=str(work_dir),
                     env=env,
                     stdout=subprocess.PIPE,
@@ -599,31 +691,58 @@ class SandboxRunner:
                 except psutil.Error:
                     ps_proc = None
 
+                def _terminate_tree() -> None:
+                    if hjob is not None:
+                        with contextlib.suppress(Exception):
+                            import win32job  # type: ignore[import-untyped]
+
+                            win32job.TerminateJobObject(hjob, 1)
+                    _kill_process_tree(proc.pid)
+
+                cached_pids: list[int] = [proc.pid]
+                last_pid_scan = 0.0
                 while proc.poll() is None:
-                    if time.monotonic() > deadline:
+                    now = time.monotonic()
+                    if now > deadline:
                         timed_out = True
-                        _kill_process_tree(proc.pid)
+                        _terminate_tree()
                         break
 
-                    if ps_proc is not None:
-                        try:
-                            total_rss = ps_proc.memory_info().rss
-                            for child in ps_proc.children(recursive=True):
-                                with contextlib.suppress(psutil.Error):
-                                    total_rss += child.memory_info().rss
-                            if total_rss > rss_limit_bytes:
-                                memory_exceeded = True
-                                _kill_process_tree(proc.pid)
-                                break
-                        except psutil.Error:
-                            pass
+                    if ps_proc is not None and (now - last_pid_scan) >= 0.12:
+                        last_pid_scan = now
+                        if hjob is not None:
+                            try:
+                                import win32job  # type: ignore[import-untyped]
 
-                    time.sleep(0.015)
+                                job_pids = win32job.QueryInformationJobObject(
+                                    hjob, win32job.JobObjectBasicProcessIdList
+                                )
+                                cached_pids = list(job_pids) or [proc.pid]
+                            except Exception:
+                                cached_pids = [proc.pid]
+                        else:
+                            try:
+                                cached_pids = [proc.pid] + [
+                                    c.pid for c in ps_proc.children(recursive=True)
+                                ]
+                            except psutil.Error:
+                                cached_pids = [proc.pid]
+
+                        total_rss = 0
+                        for pid in cached_pids:
+                            with contextlib.suppress(psutil.Error):
+                                total_rss += psutil.Process(pid).memory_info().rss
+                        if total_rss > rss_limit_bytes:
+                            memory_exceeded = True
+                            _terminate_tree()
+                            break
+
+                    time.sleep(0.025)
 
                 try:
                     stdout, stderr = proc.communicate(timeout=2.0)
                 except subprocess.TimeoutExpired:
-                    _kill_process_tree(proc.pid)
+                    _terminate_tree()
                     stdout, stderr = proc.communicate(timeout=2.0)
 
                 exit_code = proc.returncode if proc.returncode is not None else -1
@@ -792,29 +911,64 @@ class SandboxRunner:
         return params, has_explicit_raise
 
     @staticmethod
-    def _edge_values_for_type(type_hint: str, allows_none: bool) -> list[Any]:
+    def _split_top_level(text: str, sep: str) -> list[str]:
+        parts: list[str] = []
+        depth = 0
+        start = 0
+        for idx, ch in enumerate(text):
+            if ch in "[({":
+                depth += 1
+            elif ch in "])}":
+                depth = max(0, depth - 1)
+            elif ch == sep and depth == 0:
+                parts.append(text[start:idx].strip())
+                start = idx + 1
+        parts.append(text[start:].strip())
+        return [p for p in parts if p]
+
+    @classmethod
+    def _unwrap_type_hint(cls, type_hint: str) -> str:
         hint = (type_hint or "").strip().lower()
+        if not hint:
+            return ""
+        # Strip outer Optional[...] / Union[..., None] / ... | None wrappers
+        for _ in range(3):
+            if hint.startswith("typing."):
+                hint = hint[len("typing.") :].strip()
+            if hint.startswith("optional[") and hint.endswith("]"):
+                hint = hint[len("optional[") : -1].strip()
+                continue
+            if hint.startswith("union[") and hint.endswith("]"):
+                inner = hint[len("union[") : -1]
+                parts = [p for p in cls._split_top_level(inner, ",") if p != "none"]
+                if parts:
+                    hint = parts[0]
+                    continue
+            if "|" in hint:
+                parts = [p for p in cls._split_top_level(hint, "|") if p != "none"]
+                if parts:
+                    hint = parts[0]
+                    continue
+            break
+        return hint
+
+    @classmethod
+    def _edge_values_for_type(cls, type_hint: str, allows_none: bool) -> list[Any]:
+        hint = cls._unwrap_type_hint(type_hint)
         values: list[Any] = []
-        # Check container types before inner element types (e.g. list[int], dict[str, Any])
-        if any(
-            hint.startswith(prefix)
-            for prefix in ("list", "sequence", "typing.list", "typing.sequence", "tuple")
-        ):
+        if hint.startswith(("list", "sequence", "tuple")):
             values.append([])
-        elif any(
-            hint.startswith(prefix)
-            for prefix in ("dict", "mapping", "typing.dict", "typing.mapping")
-        ):
+        elif hint.startswith(("dict", "mapping")):
             values.append({})
         elif hint.startswith(("set", "frozenset")):
             values.append(set())
-        elif "str" in hint:
+        elif hint == "str" or hint.startswith("str["):
             values.extend(["", "   ", "\ufeff"])
-        elif "bool" in hint:
+        elif hint == "bool":
             values.extend([False, True])
-        elif "int" in hint:
+        elif hint == "int":
             values.extend([0, -1])
-        elif "float" in hint:
+        elif hint == "float":
             values.extend([0.0, -1.0])
         else:
             values.extend(["", []])
@@ -823,28 +977,22 @@ class SandboxRunner:
             values.append(None)
         return values
 
-    @staticmethod
-    def _default_value_for_type(type_hint: str, allows_none: bool) -> Any:
-        hint = (type_hint or "").strip().lower()
-        if any(
-            hint.startswith(prefix)
-            for prefix in ("list", "sequence", "typing.list", "typing.sequence", "tuple")
-        ):
+    @classmethod
+    def _default_value_for_type(cls, type_hint: str, allows_none: bool) -> Any:
+        hint = cls._unwrap_type_hint(type_hint)
+        if hint.startswith(("list", "sequence", "tuple")):
             return []
-        if any(
-            hint.startswith(prefix)
-            for prefix in ("dict", "mapping", "typing.dict", "typing.mapping")
-        ):
+        if hint.startswith(("dict", "mapping")):
             return {}
         if hint.startswith(("set", "frozenset")):
             return set()
-        if "str" in hint:
+        if hint == "str" or hint.startswith("str["):
             return "sample"
-        if "bool" in hint:
+        if hint == "bool":
             return False
-        if "int" in hint:
+        if hint == "int":
             return 1
-        if "float" in hint:
+        if hint == "float":
             return 1.0
         if allows_none:
             return None

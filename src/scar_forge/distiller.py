@@ -180,6 +180,23 @@ class TracebackDistiller:
         return _ANSI_CSI_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
 
     @staticmethod
+    def _normalize_exception_group(text: str) -> str:
+        if "Exception Group Traceback" not in text and "+--" not in text:
+            return text
+        cleaned_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("+-") or stripped.startswith("+ Exception Group"):
+                continue
+            if stripped.startswith("| "):
+                cleaned_lines.append(stripped[2:])
+            elif stripped == "|":
+                cleaned_lines.append("")
+            else:
+                cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
+
+    @staticmethod
     def _has_traceback_or_exception(text: str) -> bool:
         for line in text.splitlines():
             s = line.strip()
@@ -450,8 +467,8 @@ class TracebackDistiller:
         raw_chars = len(combined_raw)
         raw_tokens = count_tokens(combined_raw)
 
-        clean_stderr = self._strip_ansi(stderr_str)
-        clean_stdout = self._strip_ansi(stdout_str)
+        clean_stderr = self._normalize_exception_group(self._strip_ansi(stderr_str))
+        clean_stdout = self._normalize_exception_group(self._strip_ansi(stdout_str))
 
         if not clean_stderr.strip() or (
             not self._has_traceback_or_exception(clean_stderr)

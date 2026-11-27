@@ -67,7 +67,11 @@ def call_gemini_chat(
         for m in messages
         if str(m.get("role", "")).lower() != "system"
     ]
-    client = genai.Client(api_key=api_key)
+    timeout_ms = max(1000, int(config.llm_timeout_s * 1000))
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_ms),
+    )
     cfg_kwargs: dict[str, Any] = {
         "temperature": 0.1,
         "response_mime_type": "application/json",
